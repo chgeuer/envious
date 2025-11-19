@@ -393,4 +393,62 @@ defmodule EnviousTest do
 
     assert Envious.parse(pairs) == {:ok, expected}
   end
+
+  describe "variable interpolation" do
+    test "basic interpolation with ${VAR} syntax" do
+      assert Envious.parse("""
+             A=foo
+             B=${A}bar
+             """) == {:ok, %{"A" => "foo", "B" => "foobar"}}
+    end
+
+    test "basic interpolation with $VAR syntax" do
+      assert Envious.parse("""
+             A=foo
+             B=$A-bar
+             """) == {:ok, %{"A" => "foo", "B" => "foo-bar"}}
+    end
+
+    test "interpolation in double quotes" do
+      assert Envious.parse("""
+             export A="A"
+             export B="B and ${A} or $A"
+             """) == {:ok, %{"A" => "A", "B" => "B and A or A"}}
+    end
+
+    test "single quotes do not interpolate" do
+      assert Envious.parse("""
+             A=foo
+             B='$A and ${A} are literal'
+             """) == {:ok, %{"A" => "foo", "B" => "$A and ${A} are literal"}}
+    end
+
+    test "chained variable references" do
+      assert Envious.parse("""
+             A=hello
+             B=$A-world
+             C=$B!
+             """) == {:ok, %{"A" => "hello", "B" => "hello-world", "C" => "hello-world!"}}
+    end
+
+    test "undefined variable resolves to empty string" do
+      assert Envious.parse("B=$UNDEFINED-value") == {:ok, %{"B" => "-value"}}
+    end
+
+    test "multiple interpolations in one value" do
+      assert Envious.parse("""
+             A=hello
+             B=world
+             C="$A $B from ${A} and ${B}"
+             """) ==
+               {:ok, %{"A" => "hello", "B" => "world", "C" => "hello world from hello and world"}}
+    end
+
+    test "interpolation in unquoted values" do
+      assert Envious.parse("""
+             BASE=/usr/local
+             BIN_PATH=$BASE/bin
+             """) == {:ok, %{"BASE" => "/usr/local", "BIN_PATH" => "/usr/local/bin"}}
+    end
+  end
 end

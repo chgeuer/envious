@@ -47,6 +47,9 @@ defmodule Envious do
   - `{:ok, map}` on success, where map contains the parsed key-value pairs
   - `{:error, message}` on failure, with a descriptive error message including line/column info
 
+  Variable interpolation is supported using `$VAR` or `${VAR}` syntax in values.
+  Variables are resolved using previously defined variables in the file (top-down).
+
   ## Examples
 
       iex> Envious.parse("PORT=3000")
@@ -55,6 +58,9 @@ defmodule Envious do
       iex> Envious.parse("export API_KEY=secret\\nDATABASE_URL=postgres://localhost")
       {:ok, %{"API_KEY" => "secret", "DATABASE_URL" => "postgres://localhost"}}
 
+      iex> Envious.parse("A=foo\\nB=$A-bar")
+      {:ok, %{"A" => "foo", "B" => "foo-bar"}}
+
       iex> Envious.parse("KEY=\\"unclosed")
       {:error, "Parse error at line 1, column 5: could not parse remaining input"}
   """
@@ -62,7 +68,9 @@ defmodule Envious do
     case Parser.parse(str) do
       # Success with all input consumed
       {:ok, parsed, "", _context, _line, _offset} ->
-        {:ok, Map.new(parsed)}
+        # Build the map while resolving variable interpolations
+        result = build_env_map(parsed)
+        {:ok, result}
 
       # Success but with remaining unparsed input - this is an error
       {:ok, _parsed, remaining, _context, {line, col}, _offset} when remaining != "" ->
@@ -79,6 +87,27 @@ defmodule Envious do
         {:error, "Parse error at line #{line}, column #{col}: #{message}"}
     end
   end
+
+  # Build environment map from parsed tuples, resolving variable interpolations
+  # Variables are resolved in order, so later variables can reference earlier ones
+  defp build_env_map(parsed) do
+    Enum.reduce(parsed, %{}, fn {key, value}, acc ->
+      resolved_value = resolve_interpolations(value, acc)
+      Map.put(acc, key, resolved_value)
+    end)
+  end
+
+  # Resolve variable interpolations in a value using the accumulated environment
+  # Only resolves specially-marked interpolations from the parser, not literal $VAR in the input
+  defp resolve_interpolations(value, env) when is_binary(value) do
+    # Replace our special markers with actual variable values
+    # Format: __ENVIOUS_VAR__[varname]__
+    Regex.replace(~r/__ENVIOUS_VAR__\[([^\]]+)\]__/, value, fn _, var_name ->
+      Map.get(env, var_name, "")
+    end)
+  end
+
+  defp resolve_interpolations(value, _env), do: value
 
   @doc """
   Parse a .env file string into a map, raising on error.

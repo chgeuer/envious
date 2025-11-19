@@ -42,4 +42,89 @@ defmodule Envious.ParserTest do
     assert Parser.parse(file) ==
              {:ok, [{"FOO", "bar"}, {"BAZ", "qux"}], "", %{}, {4, 61}, 61}
   end
+
+  test "variable interpolation with ${VAR} in double quotes" do
+    file = """
+    export A="foo"
+    export B="bar and ${A}"
+    """
+
+    # Parser just parses - interpolation happens in Envious module
+    result = Envious.parse(file)
+    assert result == {:ok, %{"A" => "foo", "B" => "bar and foo"}}
+  end
+
+  test "variable interpolation with $VAR in double quotes" do
+    file = """
+    A=hello
+    B="world and $A"
+    """
+
+    result = Envious.parse(file)
+    assert result == {:ok, %{"A" => "hello", "B" => "world and hello"}}
+  end
+
+  test "variable interpolation in unquoted values" do
+    file = """
+    export A=foo
+    export B=bar-$A-baz
+    """
+
+    result = Envious.parse(file)
+    assert result == {:ok, %{"A" => "foo", "B" => "bar-foo-baz"}}
+  end
+
+  test "mixed variable interpolation formats" do
+    file = """
+    export A="A"
+    export B="B and ${A} or $A"
+    """
+
+    result = Envious.parse(file)
+    assert result == {:ok, %{"A" => "A", "B" => "B and A or A"}}
+  end
+
+  test "variable interpolation with undefined variable" do
+    file = """
+    B="value is $UNDEFINED"
+    """
+
+    result = Envious.parse(file)
+    # Undefined variables resolve to empty string
+    assert result == {:ok, %{"B" => "value is "}}
+  end
+
+  test "single quotes do not interpolate variables" do
+    file = """
+    A=foo
+    B='$A is not interpolated'
+    """
+
+    result = Envious.parse(file)
+    assert result == {:ok, %{"A" => "foo", "B" => "$A is not interpolated"}}
+  end
+
+  test "multiple interpolations in one value" do
+    file = """
+    A=hello
+    B=world
+    C="$A $B from ${A} and ${B}"
+    """
+
+    result = Envious.parse(file)
+
+    assert result ==
+             {:ok, %{"A" => "hello", "B" => "world", "C" => "hello world from hello and world"}}
+  end
+
+  test "chained variable interpolation" do
+    file = """
+    A=foo
+    B=$A-bar
+    C=$B-baz
+    """
+
+    result = Envious.parse(file)
+    assert result == {:ok, %{"A" => "foo", "B" => "foo-bar", "C" => "foo-bar-baz"}}
+  end
 end

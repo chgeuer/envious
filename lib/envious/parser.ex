@@ -137,33 +137,51 @@ defmodule Envious.Parser do
       ?]..?~
     ])
 
-  # Content inside double quotes: either escape sequences or regular characters
+  # Variable interpolation: $VAR or ${VAR}
+  # Returns the variable name tagged for later interpolation
+  var_interpolation =
+    choice([
+      # ${VAR} format - capture just the variable name
+      ignore(string("${"))
+      |> concat(var_name)
+      |> ignore(string("}"))
+      |> tag(:var_interp),
+      # $VAR format - capture just the variable name
+      ignore(string("$"))
+      |> concat(var_name)
+      |> tag(:var_interp)
+    ])
+
+  # Content inside double quotes: escape sequences, variable interpolation, or regular characters
+  # Double quotes allow variable interpolation (like shell behavior)
   double_quoted_content =
     choice([
+      var_interpolation,
       escape_sequence,
       double_quoted_regular_char
     ])
 
   # Content inside single quotes: either escape sequences or regular characters
+  # Single quotes do NOT allow variable interpolation (like shell behavior)
   single_quoted_content =
     choice([
       escape_sequence,
       single_quoted_regular_char
     ])
 
-  # Double-quoted value: "value with spaces"
-  # - Handles escape sequences and regular characters
-  # - Post-processes to convert escape sequences to actual characters
+  # Double-quoted value: "value with spaces and $VAR interpolation"
+  # - Handles escape sequences, variable interpolation, and regular characters
+  # - Post-processes to build string with interpolations resolved
   double_quoted_value =
     ignore(double_quote)
     |> times(double_quoted_content, min: 0)
     |> ignore(double_quote)
-    |> reduce({List, :to_string, []})
-    |> post_traverse(:process_escape_sequences)
+    |> post_traverse(:build_quoted_value)
 
-  # Single-quoted value: 'value with spaces'
+  # Single-quoted value: 'value with spaces, no interpolation'
   # - Handles escape sequences and regular characters
   # - Post-processes to convert escape sequences to actual characters
+  # - Does NOT support variable interpolation (like shell behavior)
   single_quoted_value =
     ignore(single_quote)
     |> times(single_quoted_content, min: 0)
@@ -175,29 +193,39 @@ defmodule Envious.Parser do
   # - Newline (\n) and carriage return (\r) - these end the value
   # - Hash (#) - this starts an inline comment
   # - Quotes (" and ') - these start quoted values
+  # - Dollar ($) - this starts variable interpolation
+  # - Brace ({, }) - reserved for ${VAR} syntax
   #
   # Character ranges:
   # - ?\s..?! is space (0x20) through exclamation (0x21), excluding double-quote (0x22)
-  # - ?$..?& is dollar through ampersand, excluding hash (0x23) and single-quote (0x27)
-  # - ?(..?~ is open-paren through tilde - includes alphanumeric and symbols
+  # - ?%..?& is percent through ampersand, excluding hash (0x23) and single-quote (0x27)
+  # - ?(..?z is open-paren through lowercase z, excluding braces ({ and })
+  # - ?|..?~ is pipe through tilde
   unquoted_value_char =
     utf8_char([
       # Space (32) through exclamation (33), which excludes double-quote (34)
       ?\s..?!,
-      # Dollar (36) through ampersand (38), which excludes hash (35) and single-quote (39)
-      ?$..?&,
-      # Open-paren (40) through tilde (126) - includes all alphanumeric and symbols
-      ?(..?~
+      # Percent (37) through ampersand (38), which excludes hash (35), dollar (36), and single-quote (39)
+      ?%..?&,
+      # Open-paren (40) through lowercase z (122), which excludes left-brace (123)
+      ?(..?z,
+      # Pipe (124) through tilde (126), which excludes right-brace (125)
+      ?|..?~
     ])
 
-  # Unquoted value: traditional unquoted values
-  # - Collect 0 or more value characters (allows empty values like KEY=)
-  # - Convert the character list to a string
-  # - Trim whitespace from both ends (handles inline comments: "value # comment")
+  # Unquoted value content: either variable interpolation or regular characters
+  unquoted_value_content =
+    choice([
+      var_interpolation,
+      unquoted_value_char
+    ])
+
+  # Unquoted value: supports variable interpolation
+  # - Collect 0 or more value parts (allows empty values like KEY=)
+  # - Post-process to trim whitespace (handles inline comments: "value # comment")
   unquoted_value =
-    times(unquoted_value_char, min: 0)
-    |> reduce({List, :to_string, []})
-    |> post_traverse(:trim_value)
+    times(unquoted_value_content, min: 0)
+    |> post_traverse(:build_unquoted_value)
 
   # Parse the value portion after the = sign
   # Values can be:
@@ -274,28 +302,73 @@ defmodule Envious.Parser do
   defp not_line_terminator(<<?\r, _::binary>>, context, _, _), do: {:halt, context}
   defp not_line_terminator(_, context, _, _), do: {:cont, context}
 
-  # Post-traversal callback to trim whitespace from parsed values
+  # Post-traversal callback to build a quoted value with variable interpolation support
   #
-  # This is used to remove trailing whitespace before inline comments.
-  # Example: "value  # comment" becomes "value"
+  # Takes the accumulated tokens (which may include :var_interp tags and character codes)
+  # and builds a single string value. Variable interpolations are left as markers
+  # to be resolved later by the main Envious module.
   #
   # Parameters:
   # - rest: Remaining input after parsing
-  # - [value]: The parsed value (as a single-element list from the accumulator)
+  # - acc: Accumulated tokens from the quoted value
   # - context: Parser context
   # - _line, _offset: Position information (unused)
   #
-  # Returns: {rest, [trimmed_value], context}
-  #
-  # Note: We must return `rest` (not an empty list) to allow the parser to
-  # continue processing remaining input. Returning [] would consume all input.
-  defp trim_value(rest, [value], context, _line, _offset) when is_binary(value) do
-    {rest, [String.trim(value)], context}
+  # Returns: {rest, [string_value], context}
+  defp build_quoted_value(rest, acc, context, _line, _offset) do
+    # Reverse the accumulator and build the string
+    value = acc |> Enum.reverse() |> build_value_string([])
+    {rest, [value], context}
   end
 
-  # Fallback clause for trim_value when accumulator doesn't match expected pattern
-  defp trim_value(rest, acc, context, _line, _offset) do
-    {rest, acc, context}
+  # Post-traversal callback to build an unquoted value with variable interpolation support
+  #
+  # Similar to build_quoted_value but also trims whitespace.
+  #
+  # Parameters:
+  # - rest: Remaining input after parsing
+  # - acc: Accumulated tokens from the unquoted value
+  # - context: Parser context
+  # - _line, _offset: Position information (unused)
+  #
+  # Returns: {rest, [string_value], context}
+  defp build_unquoted_value(rest, acc, context, _line, _offset) do
+    # Reverse the accumulator and build the string, then trim
+    value = acc |> Enum.reverse() |> build_value_string([]) |> String.trim()
+    {rest, [value], context}
+  end
+
+  # Build a string from a list of tokens, handling variable interpolations
+  # Tokens can be:
+  # - Integers (character codes)
+  # - {:var_interp, [var_name]} tuples representing variable interpolations
+  # Returns a string with interpolation markers using a special syntax that won't conflict with user input
+  defp build_value_string([], acc) do
+    acc
+    |> Enum.reverse()
+    |> IO.iodata_to_binary()
+    |> process_escapes_in_string([])
+    |> IO.iodata_to_binary()
+  end
+
+  defp build_value_string([{:var_interp, [var_name]} | rest], acc) when is_binary(var_name) do
+    # Use a special marker that won't conflict with normal .env content
+    # Format: __ENVIOUS_VAR__[varname]__
+    build_value_string(rest, ["__ENVIOUS_VAR__[#{var_name}]__" | acc])
+  end
+
+  defp build_value_string([char | rest], acc) when is_integer(char) do
+    build_value_string(rest, [<<char::utf8>> | acc])
+  end
+
+  defp build_value_string([other | rest], acc) do
+    # Handle any other tokens (shouldn't normally happen)
+    build_value_string(rest, [to_string(other) | acc])
+  end
+
+  # Process escape sequences in a string (for values that support them)
+  defp process_escapes_in_string(binary, acc) when is_binary(binary) do
+    process_escapes(binary, acc)
   end
 
   # Post-traversal callback to convert [value, key] list to {key, value} tuple
